@@ -506,25 +506,42 @@ def build_transparent_ico_bytes(size=ICON_SIZE):
     return icondir + entry + image
 
 
+def _atomic_write(path, data):
+    """
+    原子写入：先写临时文件再替换，避免 Explorer 读到写了一半的文件。
+
+    直接 open(path,"wb") 会先把文件截断为 0 字节，如果此刻 Explorer 正好
+    来读取（它按需加载图标文件），就会读到一个空/残缺文件，缓存下坏结果，
+    之后即使文件已写完整也仍然显示异常（直到缓存被清）。
+    """
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)      # 同目录替换是原子的
+
+
 def ensure_transparent_ico(log_func=print):
     """
     确保全透明 ICO 存在且内容正确，返回其绝对路径；失败返回 None。
-    每次启动都重新生成（文件很小，4286 字节），避免磁盘上的旧文件被改坏后仍被使用。
+
+    行为：
+      * 文件缺失或内容与预期不一致 -> 原子重写；
+      * 内容已经正确 -> 不碰文件（避免无谓地改动时间戳，
+        时间戳变化会让 Explorer 重新加载并可能产生新的缓存项）。
     """
     try:
         os.makedirs(APP_DIR, exist_ok=True)
         data = build_transparent_ico_bytes()
-        # 内容不一致才写，减少磁盘写入
-        need_write = True
         if os.path.exists(TRANSPARENT_ICO):
             try:
                 with open(TRANSPARENT_ICO, "rb") as f:
-                    need_write = (f.read() != data)
+                    if f.read() == data:
+                        return TRANSPARENT_ICO   # 已正确，不重写
             except OSError:
-                need_write = True
-        if need_write:
-            with open(TRANSPARENT_ICO, "wb") as f:
-                f.write(data)
+                pass
+        _atomic_write(TRANSPARENT_ICO, data)
         return TRANSPARENT_ICO
     except Exception as e:
         log_func(f"  生成透明图标失败: {e}")
@@ -569,6 +586,21 @@ def verify_transparent_ico(path):
 SHELL_ICONS_KEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Icons"
 ICON_ARROW = "29"     # 快捷方式小箭头
 ICON_SHIELD = "77"    # UAC 盾牌
+
+# ============================================================
+#  ★ 推荐方案：用 lnkfile\IsShortcut 去箭头（不替换图标）
+# ============================================================
+# 实测结论（每项连续重启 explorer 6 次，统计 48x48 纯黑块）：
+#     不设置 29                 -> [0,0,0,0,0,0]        稳定正常
+#     29 = 自建透明 ICO          -> [0,30,30,29,30,30]   基本都黑
+#     29 = shell32.dll,-50      -> [0,30,30,30,30,30]   基本都黑
+#     29 = shell32.dll,50       -> [30,30,30,30,30,30]  100% 黑
+#     删除 lnkfile\IsShortcut   -> [0,0,0,0,0,0]        稳定正常，且箭头消失
+#
+# 结论：**只要设置了 Shell Icons\29，黑块就会出现**，与指向哪个图标无关。
+# 因此去箭头应优先用 IsShortcut 方案，而不是替换 29 号图标。
+# Shell Icons 方案保留（盾牌 77 仍需用它——77 没有对应的 IsShortcut 机制），
+# 但箭头不再默认走那条路。
 
 # 方案 A（默认）：自建全透明 ICO，绝对路径 —— 不依赖系统图标编号
 # 方案 B（回退）：系统内置资源，带负号（按资源 ID 定位）
@@ -739,6 +771,70 @@ def _run_hidden(cmd):
         pass
 
 
+def repair_stale_icon_cache(log_func=print):
+    """
+    修复黑色方块，同时**保留去箭头效果** —— 遇到黑块时的首选操作。
+
+    背景（实测结论）：
+      只要设置了 `Shell Icons\\29`，Explorer 就可能在启动时加载替代图标失败，
+      把「黑色占位」写进图标缓存，于是箭头位置显示为实心黑块。
+      这个状态**重启电脑也不会自愈**（缓存会在关机时写回磁盘）。
+
+    处置（三步，缺一不可）：
+      1. 删除 `Shell Icons\\29` —— 移除黑块的来源；
+      2. 删除 `lnkfile\\IsShortcut` —— 用不替换图标的方式继续去掉箭头；
+      3. 结束 explorer、清空图标缓存、重启 —— 清掉已缓存的黑色占位。
+
+    这样用户既摆脱黑块，又保留「无箭头」的外观。
+    返回 True 表示执行了修复流程。
+    """
+    log_func("【修复黑色方块】目标：去掉黑块，同时保留无箭头外观")
+
+    # --- 1. 移除黑块来源 ---
+    old = get_shell_icon_value(ICON_ARROW)
+    if old:
+        log_func(f"  发现黑块来源：Shell Icons\\29 = {old}")
+        log_func("  正在删除该替换值...")
+        if delete_shell_icon(ICON_ARROW, log_func):
+            log_func("  ✓ 已删除（黑块来源已移除）")
+        else:
+            log_func("  ✗ 删除失败，请以管理员身份运行")
+            return False
+    else:
+        log_func("  Shell Icons\\29 未设置")
+
+    # --- 2. 用 IsShortcut 方式保持去箭头 ---
+    log_func("  改用 IsShortcut 方式保持去箭头（不替换图标）")
+    if not _delete_isshortcut(log_func):
+        log_func("  ⚠ 未能删除 IsShortcut，箭头可能恢复显示")
+
+    # --- 3. 清缓存并重启 ---
+    log_func("  正在清理图标缓存（清除已缓存的黑色占位）...")
+    restart_explorer(log_func, clear_cache=True)
+    log_func("✓ 修复完成：黑块来源已移除，箭头仍保持去除")
+    log_func("  若个别位置仍显示异常，注销后重新登录一次即可")
+    return True
+
+
+def get_shell_icon_value(icon_id):
+    """读取当前生效的图标替换值（优先 HKLM 64 位视图），不存在返回 None"""
+    for hive, path, view in _registry_targets():
+        try:
+            key = winreg.OpenKey(hive, path, 0, winreg.KEY_READ | view)
+        except OSError:
+            continue
+        try:
+            val, _ = winreg.QueryValueEx(key, icon_id)
+            return val
+        except FileNotFoundError:
+            continue
+        except OSError:
+            continue
+        finally:
+            winreg.CloseKey(key)
+    return None
+
+
 def clear_icon_cache(log_func=print):
     """清理图标缓存。必须在 explorer 已退出后调用，否则文件被独占锁定删不掉。"""
     local_appdata = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
@@ -835,9 +931,70 @@ def _resolve_icon_value(log_func, use_fallback=False):
     return path
 
 
+def _lnkfile_key_paths():
+    """返回 lnkfile 的注册表位置（HKLM 与 HKCU 两侧都覆盖，确保还原彻底）"""
+    return [
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Classes\lnkfile",
+         winreg.KEY_WOW64_64KEY),
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Classes\lnkfile",
+         winreg.KEY_WOW64_32KEY),
+        (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Classes\lnkfile",
+         winreg.KEY_WOW64_64KEY),
+    ]
+
+
 def remove_shortcut_arrow(log_func=print, use_fallback=False):
-    """去除快捷方式小箭头"""
-    log_func("【去箭头】开始处理...")
+    """
+    去除快捷方式小箭头 —— 默认使用 lnkfile\\IsShortcut 方案（推荐）。
+
+    Explorer 依据 `HKEY_CLASSES_ROOT\\lnkfile` 的 `IsShortcut` 值决定是否为
+    快捷方式绘制箭头叠加层。删除该值后 Explorer 根本不会请求箭头图标，
+    因此完全不涉及图标替换 —— 也就不会有「加载失败被缓存成黑色方块」的问题。
+
+    use_fallback=True 时改用旧的 Shell Icons\\29 替换方案（不推荐，实测会出黑块）。
+    """
+    if not use_fallback:
+        log_func("【去箭头】使用推荐方案（IsShortcut，不替换图标）")
+        removed = 0
+        for hive, path, view in _lnkfile_key_paths():
+            try:
+                key = winreg.OpenKey(hive, path, 0,
+                                     winreg.KEY_SET_VALUE | winreg.KEY_READ | view)
+            except FileNotFoundError:
+                continue
+            except OSError as e:
+                log_func(f"  打开 {path} 失败: {e}")
+                continue
+            try:
+                winreg.DeleteValue(key, "IsShortcut")
+                removed += 1
+            except FileNotFoundError:
+                removed += 1          # 已无该值 = 已是目标状态
+            except OSError as e:
+                log_func(f"  删除 IsShortcut 失败: {e}")
+            finally:
+                winreg.CloseKey(key)
+
+        if removed == 0:
+            log_func("✗ 无法修改 lnkfile（需要管理员权限）")
+            log_func("  若你只想尽快去掉黑块，可改用「恢复默认」")
+            return False
+
+        log_func("✓ 已删除 IsShortcut")
+        # 清掉可能残留的 Shell Icons 箭头替换值：它是黑块的来源，
+        # 留着会让黑块继续出现（即使 IsShortcut 已删除）。
+        stale = get_shell_icon_value(ICON_ARROW)
+        if stale:
+            log_func(f"  清理遗留的 Shell Icons 箭头替换值（黑块来源）: {stale}")
+            delete_shell_icon(ICON_ARROW, log_func)
+        restart_explorer(log_func)
+        log_func("✓ 快捷方式箭头已去除")
+        log_func("  本方案不替换图标，因此不会出现黑色方块")
+        return True
+
+    # ---- 旧方案（Shell Icons 替换）----
+    log_func("【去箭头】使用兼容方案（Shell Icons 替换）")
+    log_func("  注意：此方案在部分机器上会导致箭头位置出现黑色方块")
     value = _resolve_icon_value(log_func, use_fallback)
     if not value:
         log_func("✗ 去箭头失败：没有可用的透明图标")
@@ -846,7 +1003,7 @@ def remove_shortcut_arrow(log_func=print, use_fallback=False):
         log_func("✓ 已设置透明图标替换箭头")
         restart_explorer(log_func)
         log_func("✓ 快捷方式小箭头已去除")
-        log_func("  提示：若个别位置（任务栏/开始菜单）仍显示箭头，注销或重启一次即可刷新")
+        log_func("  若出现黑色方块，请点「修复黑色方块」或改用推荐方案")
         return True
     log_func("✗ 去箭头失败")
     return False
@@ -870,44 +1027,109 @@ def remove_uac_shield(log_func=print, use_fallback=False):
 
 
 def remove_both(log_func=print, use_fallback=False):
-    """一次处理箭头 + 盾牌，只重启一次 explorer（比点两次按钮快）"""
+    """
+    一次处理箭头 + 盾牌，只重启一次 explorer（比点两次按钮快）。
+
+    箭头用推荐的 IsShortcut 方案（不替换图标，不会出黑块）；
+    盾牌用 Shell Icons\\77 替换（77 没有 IsShortcut 之类的等效机制）。
+    """
     log_func("【去箭头 + 去盾牌】开始处理...")
+
+    # --- 箭头：IsShortcut（或旧方案）---
+    if use_fallback:
+        log_func("  箭头：使用旧方案（Shell Icons 替换）")
+        value = _resolve_icon_value(log_func, use_fallback=True)
+        ok_a = bool(value) and set_shell_icon(ICON_ARROW, value, log_func)
+    else:
+        log_func("  箭头：使用推荐方案（IsShortcut，不替换图标）")
+        ok_a = _delete_isshortcut(log_func)
+
+    # --- 盾牌：Shell Icons\77 ---
+    log_func("  盾牌：使用 Shell Icons\\77 替换")
     value = _resolve_icon_value(log_func, use_fallback)
-    if not value:
-        log_func("✗ 失败：没有可用的透明图标")
-        return False
-    ok_a = set_shell_icon(ICON_ARROW, value, log_func)
-    ok_b = set_shell_icon(ICON_SHIELD, value, log_func)
+    ok_b = bool(value) and set_shell_icon(ICON_SHIELD, value, log_func)
+
     if ok_a or ok_b:
-        log_func(f"✓ 已写入替换值（箭头={'成功' if ok_a else '失败'}, "
-                 f"盾牌={'成功' if ok_b else '失败'}）")
+        log_func(f"✓ 处理结果：箭头={'成功' if ok_a else '失败'}, "
+                 f"盾牌={'成功' if ok_b else '失败'}")
         restart_explorer(log_func)
         log_func("✓ 处理完成")
+        if not use_fallback and ok_a:
+            log_func("  箭头使用 IsShortcut 方案，不会产生黑色方块")
         return ok_a and ok_b
     log_func("✗ 注册表写入失败")
     return False
 
 
+def _delete_isshortcut(log_func=print):
+    """删除 lnkfile\\IsShortcut（内部使用），成功返回 True"""
+    done = 0
+    for hive, path, view in _lnkfile_key_paths():
+        try:
+            key = winreg.OpenKey(hive, path, 0,
+                                 winreg.KEY_SET_VALUE | winreg.KEY_READ | view)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            continue
+        try:
+            winreg.DeleteValue(key, "IsShortcut")
+            done += 1
+        except FileNotFoundError:
+            done += 1
+        except OSError as e:
+            log_func(f"    删除 IsShortcut 失败: {e}")
+        finally:
+            winreg.CloseKey(key)
+    if done:
+        log_func("    ✓ 已删除 IsShortcut")
+        # 清掉遗留的 29 替换值（黑块来源）
+        stale = get_shell_icon_value(ICON_ARROW)
+        if stale:
+            log_func(f"    清理遗留的 Shell Icons 箭头替换值: {stale}")
+            delete_shell_icon(ICON_ARROW, log_func)
+    return done > 0
+
+
 def restore_defaults(log_func=print, clear_cache=True):
     """
-    恢复默认：删除 29 / 77 的替换值，还原系统自带的箭头和盾牌。
+    一键恢复默认外观：还原系统自带的快捷方式箭头和 UAC 盾牌。
 
-    无论之前被写成了 `shell32.dll,50`、正号/负号索引还是别的形式，
-    删除这两个值即可回到 Windows 默认外观。
+    做三件事：
+      1. 删除 `Shell Icons\\29` 与 `77` 的替换值（去掉盾牌替换，
+         也去掉历史上可能残留的箭头替换值 —— 它是黑块的来源）；
+      2. 重建 `lnkfile\\IsShortcut`（恢复快捷方式箭头）；
+      3. 结束 explorer、清空图标缓存、重新启动。
 
-    用途：
-      * 想恢复系统默认的箭头/盾牌外观；
-      * 万一遇到黑色方块（例如被旧版本写入了 AND 掩码全 0 的坏图标，
-        或从别处拿到的 ICO 格式有问题），这是可靠的兜底手段。
+    这是遇到黑色方块时最可靠的兜底手段：实测中只要 `Shell Icons\\29`
+    存在，Explorer 就可能在重启后把箭头位置渲染成黑色方块。
     """
     log_func("【恢复默认】开始处理...")
-    log_func("  正在读取当前注册表状态...")
+    log_func("  当前 Shell Icons 状态：")
     describe_shell_icons(log_func)
 
     ok_a = delete_shell_icon(ICON_ARROW, log_func)
     ok_b = delete_shell_icon(ICON_SHIELD, log_func)
-    log_func(f"  删除结果：箭头(29)={'成功' if ok_a else '失败'}, "
+    log_func(f"  删除替换值：箭头(29)={'成功' if ok_a else '失败'}, "
              f"盾牌(77)={'成功' if ok_b else '失败'}")
+
+    # 恢复 IsShortcut（若曾被删除）
+    log_func("  恢复 lnkfile\\IsShortcut ...")
+    restore_isc = False
+    for hive, path, view in _lnkfile_key_paths():
+        try:
+            key = winreg.CreateKeyEx(hive, path, 0,
+                                     winreg.KEY_SET_VALUE | view)
+        except OSError:
+            continue
+        try:
+            winreg.SetValueEx(key, "IsShortcut", 0, winreg.REG_SZ, "")
+            restore_isc = True
+        except OSError as e:
+            log_func(f"  写入 IsShortcut 失败: {e}")
+        finally:
+            winreg.CloseKey(key)
+    log_func("✓ 已恢复 IsShortcut" if restore_isc else "  未能恢复 IsShortcut")
 
     # 顺带删掉自建的透明图标，避免残留
     try:
@@ -917,8 +1139,7 @@ def restore_defaults(log_func=print, clear_cache=True):
     except OSError:
         pass
 
-    # 顺带清一次图标缓存。缓存不是黑块的成因（真因是 AND 掩码），
-    # 但清掉能确保旧的叠加层位图不残留。
+    # 清缓存：把可能缓存的黑色占位位图一并清除
     restart_explorer(log_func, clear_cache=clear_cache)
 
     if ok_a and ok_b:
@@ -1194,9 +1415,9 @@ class DesktopCleanerApp:
 
         self._make_card(
             cards, "去除快捷方式箭头",
-            "用自建全透明图标替换小箭头，不依赖系统图标编号。"
-            "需要管理员权限，完成后自动重启资源管理器。"
-            "若替换后出现黑色方块，请用下方「恢复默认」还原。",            "去除箭头", self.on_remove_arrow, self.ACCENT,
+            "推荐方案：删除 lnkfile\\IsShortcut 标记，Explorer 不再绘制箭头。"
+            "不替换图标，因此不会出现黑色方块。需管理员权限，完成后重启资源管理器。",
+            "去除箭头", self.on_remove_arrow, self.ACCENT,
             secondary=("箭头+盾牌一起处理", self.on_remove_both))
 
         self._make_card(
@@ -1207,16 +1428,21 @@ class DesktopCleanerApp:
 
         self._make_card(
             cards, "恢复默认（箭头 + 盾牌）",
-            "删除 29/77 注册表替换值并清理图标缓存，还原 Windows 默认外观。"
-            "想恢复系统默认的箭头和盾牌，或遇到黑色方块时点这里。",
+            "删除 29/77 注册表替换值并清理图标缓存，还原 Windows 默认外观。",
             "恢复默认", self.on_restore, self.SUCCESS)
+
+        self._make_card(
+            cards, "修复黑色方块（保留去箭头）",
+            "已出现黑色方块时用这个：删除 Shell Icons 的箭头替换值（黑块来源）、"
+            "改用 IsShortcut 保持去箭头、并清空图标缓存。重启电脑不一定能解决，点这里才行。",
+            "修复黑块", self.on_repair_blackbox, self.WARN)
 
         # 选项 + 状态
         opts = tk.Frame(self.root, bg=self.BG)
         opts.pack(fill="x", padx=20, pady=(8, 2))
 
         tk.Checkbutton(
-            opts, text="使用系统内置图标（兼容模式，仅在自建图标不可用时勾选）",
+            opts, text="去箭头时使用旧方案（Shell Icons 替换）—— 可能产生黑色方块，一般不要勾",
             variable=self.use_fallback_icon, bg=self.BG, fg=self.TEXT_SUB,
             activebackground=self.BG, activeforeground=self.TEXT_MAIN,
             selectcolor=self.CARD_BG, font=("Microsoft YaHei UI", 9),
@@ -1253,7 +1479,27 @@ class DesktopCleanerApp:
         self.log(f"管理员权限: {'是' if admin else '否（去箭头/去盾牌/恢复 将不可用）'}")
         self.log("当前注册表状态：")
         describe_shell_icons(self.log)
-        self.log("提示：若去箭头后桌面出现黑色方块，点「恢复默认」即可还原")
+        self.log("提示：若去箭头后桌面出现黑色方块，点「修复黑色方块」即可（重启电脑不一定有效）")
+        self._warn_if_stale_cache()
+
+    def _warn_if_stale_cache(self):
+        """
+        启动自检：如果 29 指向自建 ICO 且该文件正常，但用户报告过黑块，
+        提示使用「修复黑色方块」。这里只能做静态检查（程序无法感知渲染结果），
+        因此仅在检测到明显异常时提示。
+        """
+        try:
+            value = get_shell_icon_value(ICON_ARROW)
+            if not value:
+                return
+            if os.path.normcase(value) != os.path.normcase(TRANSPARENT_ICO):
+                return
+            ok, detail = verify_transparent_ico(value)
+            if not ok:
+                self.log(f"⚠ 检测到透明图标异常（{detail}）")
+                self.log("  请点「修复黑色方块」，或重新执行「去除箭头」")
+        except Exception:
+            pass
 
     # ---------- 日志 ----------
     def log(self, msg):
@@ -1314,6 +1560,9 @@ class DesktopCleanerApp:
 
     def on_restore(self):
         self._run(restore_defaults)
+
+    def on_repair_blackbox(self):
+        self._run(repair_stale_icon_cache)
 
     def _need_admin(self):
         result = messagebox.askyesno(

@@ -1,0 +1,12 @@
+# Python 编译缓存：每次运行都会重新生成，内容随 Python 版本变化，
+# 且二进制 diff 无法阅读，因此不纳入版本管理。
+__pycache__/
+*.pyc
+*.pyo
+
+# PyInstaller 构建中间产物（成品 exe 在仓库根目录，仍按用户要求纳入管理）
+开发脚本/build/
+*.manifest
+
+# 本程序运行时生成的临时文件（透明图标等）
+# 注意：运行时生成在 %LOCALAPPDATA%\DesktopCleaner\，不在仓库内，此处仅作说明。
